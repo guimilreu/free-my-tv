@@ -57,6 +57,35 @@ final class Recs {
         int mine;               // Trakt: PROGRESS, LIKED (watchlist, recommended) or 0 (TMDB's)
         boolean detailed;
         java.io.File photo;     // one of your own photos (Photos): no title, no caption
+        String overview = "", year = "", genres = "";   // the cinematic hero's synopsis and details line
+        double rating;
+    }
+
+    /** A row of the cinematic home screen ("Trending now", "Popular · Netflix"…), only titles on the TV's apps. */
+    static final class Row {
+        final String id;        // "trending", "mood:1", "popular:netflix"…: the title comes from it in the current language
+        final String title;
+        final List<Pick> items;
+
+        Row(String id, List<Pick> items) {
+            this.id = id;
+            this.title = rowTitle(id);
+            this.items = items;
+        }
+    }
+
+    private static String rowTitle(String id) {
+        switch (id) {
+            case "for-you": return Ui.tr("For You");
+            case "trending": return Ui.tr("Trending now");
+            case "new": return Ui.tr("New releases");
+            case "episodes": return Ui.tr("New episodes");
+            case "acclaimed": return Ui.tr("Critically acclaimed");
+            case "mood:0": return Ui.tr("Family time");
+            case "mood:1": return Ui.tr("Comedy and adventure");
+            case "mood:2": return Ui.tr("Action and suspense");
+            default: return id.startsWith("popular:") ? Ui.trf("Popular · {app}", "app", name(id.substring(8))) : "";
+        }
     }
 
     interface Listener { void onRecs(); }
@@ -67,7 +96,13 @@ final class Recs {
     static final int MAX_CARDS = 6;
 
     /** The backdrops: on a 720p UI, TMDB's 1280-wide copy shows the same and is lighter to download and decode. */
-    private static final String IMAGES = "https://image.tmdb.org/t/p/" + (Backdrop.W <= 1280 ? "w1280" : "original");
+    // The cinematic background: 1280 wide behind the scrims looks the same as the original on a 1080p UI, and is a
+    // fifth of the download and the decode, which keeps the background quick to follow the focus.
+    private static final String IMAGES = "https://image.tmdb.org/t/p/w1280";
+    private static final String THUMBS = "https://image.tmdb.org/t/p/w780";
+    /** The rows' cards (16:9) at their focused size, decoded as RGB_565: 200 KB each, so whole rows fit in memory. */
+    static final int THUMB_W = Math.round(424f * Backdrop.W / 1920), THUMB_H = THUMB_W * 9 / 16;
+    private static final int THUMBS_KEPT = 56, THUMB_FILES = 320, ROW_MAX = 16, ROW_EACH = 10;
     private static final String POSTERS = "https://image.tmdb.org/t/p/w500";
     /** TMDB's Animation genre (movies and shows: cartoons and anime), left out with Picks > Cartoons and anime off. */
     private static final int ANIMATION = 16;
@@ -75,7 +110,7 @@ final class Recs {
     /** How often Trakt is asked whether the account changed (marked watched, the watchlist): one small request. */
     private static final long TRAKT_EVERY = 10 * 60_000L;
     /** Bump when what is saved for each title changes (the saved list is discarded and fetched again). */
-    private static final int CACHE_VERSION = 6;   // 6: lists of up to POOL + TRAKT_MAX
+    private static final int CACHE_VERSION = 7;   // 7: the cinematic rows
     /** TMDB's titles in the list (trending, then the new releases), as on main. */
     private static final int POOL = 24;
     /** Trakt's titles in the list: about what the tabs show of them (now(): up to 2 in 5 in progress, 3 in 5 liked). */
@@ -193,6 +228,16 @@ final class Recs {
     private final Map<String, Backdrop> images = new LinkedHashMap<>(16, 0.75f, true);   // this hour's, built and ready to draw
     private final java.util.Set<String> pending = new java.util.HashSet<>();
     private volatile List<Pick> picks = new ArrayList<>();
+    private volatile List<Row> rows = new ArrayList<>();
+    /** The TV's services by TMDB provider id, from the last list (the rows ask TMDB per service). */
+    private volatile Map<Integer, String[]> services = new HashMap<>();
+    private volatile List<Pick> trending = new ArrayList<>();
+    // Row cards: decoded on their own thread, so a row's pictures never wait behind the list or a background.
+    private final ExecutorService thumbIo = Executors.newSingleThreadExecutor();
+    private final Map<String, Poster> thumbs = new LinkedHashMap<>(64, 0.75f, true);
+    private final Set<String> thumbsPending = new HashSet<>();
+    private volatile Runnable thumbListener;
+    private boolean thumbPosted;
     private volatile int period = -1;
     private volatile long listAt;
     private volatile boolean fetching;
@@ -211,6 +256,8 @@ final class Recs {
         try {
             String saved = cache.getString("picks", null);
             if (saved != null) picks = parse(new JSONArray(saved));
+            String savedRows = cache.getString("rows", null);
+            if (savedRows != null) rows = parseRows(new JSONArray(savedRows));
             period = cache.getInt("period", -1);
             listAt = cache.getLong("listAt", 0);
             listLanguage = cache.getString("language", cache.getBoolean("english", false) ? "en" : "pt");
@@ -536,7 +583,7 @@ final class Recs {
         if (!newKey && !newTrakt && failedAt != 0 && sinceFail >= 0 && sinceFail < 10 * 60_000L) return;
         int p = period(now);
         boolean stale = newKey || p != period || now - listAt > LIST_EVERY || now < listAt || picks.isEmpty()
-                || !listLanguage.equals(Ui.language);
+                || rows.isEmpty() || !listLanguage.equals(Ui.language);
         boolean missing = false;
         for (Pick pick : wanted()) missing |= !pick.detailed || !hasImage(pick) || needsLink(pick);
         boolean checkTrakt = !stale && !newTrakt && Trakt.signedIn(context) && (now - traktCheckedAt > TRAKT_EVERY || now < traktCheckedAt);
@@ -578,6 +625,13 @@ final class Recs {
                         last = e.getMessage() == null ? e.toString() : e.getMessage();
                     }
                     findLink(pick);
+                }
+                if (list) {
+                    try {
+                        fetchRows();
+                    } catch (Exception e) {   // the picks still show: the rows come with the next list
+                        AppLog.w("rows: " + e.getMessage());
+                    }
                 }
                 save();
                 if (tried > 0 && failures == tried) throw new IOException(last);
@@ -672,7 +726,7 @@ final class Recs {
         });
     }
 
-    /** This hour's picks for the TMDB tabs (Explore, Movies, Shows), without repeats. */
+    /** This hour's picks (all, movies, shows), without repeats: the screensaver's and the details' first. */
     List<Pick> wanted() {
         List<Pick> out = new ArrayList<>();
         java.util.Set<String> seen = new java.util.HashSet<>();
@@ -698,7 +752,7 @@ final class Recs {
         boolean any = false;
         for (String[] s : SERVICES) any |= installed(s[2]);
         // The services the TV has, by their TMDB ids in your region.
-        Map<Integer, String[]> services = new HashMap<>();
+        Map<Integer, String[]> services = new java.util.LinkedHashMap<>();
         JSONArray providers = get("/watch/providers/movie?language=" + lang() + "&watch_region=" + REGION).getJSONArray("results");
         // The TV's other apps by name: a service SERVICES doesn't know is theirs when the names are the same.
         Map<String, String[]> apps = new HashMap<>();
@@ -725,6 +779,7 @@ final class Recs {
         byName = found;
         writeByName(found);
         if (services.isEmpty()) throw new IOException(any ? NO_APPS : NO_KNOWN_APPS);
+        this.services = services;
         // Signed in to Trakt: what they're in the middle of comes first, then their watchlist and Trakt's
         // recommendations; what they've watched stays out. Trakt failing leaves the picks as they'd be without it.
         // The list keeps the account it was made with (0: none, and always outside :home), so a list the screensaver's
@@ -825,6 +880,9 @@ final class Recs {
         alternate(list, seen, listMovies, listShows, TRAKT_MAX);
         alternate(list, seen, recMovies, recShows, TRAKT_MAX);
         int ours = list.size();
+        List<Pick> hot = new ArrayList<>();
+        alternate(hot, new java.util.HashSet<>(), hotMovies, hotShows, ROW_MAX);
+        trending = hot;
         alternate(list, seen, hotMovies, hotShows, ours + POOL);
         alternate(list, seen, newMovies, newShows, ours + POOL);
         if (list.isEmpty()) throw new IOException("TMDB returned no recommendations");
@@ -833,6 +891,233 @@ final class Recs {
         period = p;
         listAt = System.currentTimeMillis();
         listLanguage = Ui.language;
+    }
+
+    // MARK: - Rows (the cinematic home screen)
+
+    /** Each period's mood row: TMDB genres for movies and for shows (Animation left to the person's choice). */
+    private static final String[][] MOODS = {{"10751", "10762|10751"}, {"35|12", "35|10759"}, {"28|53|80", "10759|9648|80"}};
+
+
+    /** The rows, with only the titles on the TV's apps that are on (Picks from); rows left with under 3 don't show. */
+    List<Row> rows() {
+        List<Row> out = new ArrayList<>();
+        if (!hasKey(context)) return out;
+        Map<String, Boolean> have = new HashMap<>();
+        for (Row r : rows) {
+            List<Pick> items = new ArrayList<>();
+            for (Pick p : r.items) if (p.pkg != null && have.computeIfAbsent(p.pkg, this::installed)) items.add(p);
+            if (items.size() >= 3) out.add(items.size() == r.items.size() && r.title.equals(rowTitle(r.id)) ? r : new Row(r.id, items));
+        }
+        return out;
+    }
+
+    /**
+     * Trending, new releases, the period's mood, new episodes, the acclaimed ones and what's popular on each app, asked
+     * per service (so each title knows its app without a details request each). A title shows in one row only.
+     */
+    private void fetchRows() throws Exception {
+        Map<Integer, String[]> svc = services;
+        if (svc.isEmpty()) return;
+        Map<Integer, String> movieGenres = genreNames("movie"), tvGenres = genreNames("tv");
+        List<Row> out = new ArrayList<>();
+        Set<String> used = new HashSet<>();
+        addRow(out, used, "trending", trending);
+        addRow(out, used, "new", merge(svc, "movie", "&primary_release_date.gte=" + day(-120)
+                + "&primary_release_date.lte=" + day(0) + "&vote_count.gte=15&sort_by=popularity.desc", movieGenres));
+        int now = period(System.currentTimeMillis());
+        String[] mood = MOODS[now];
+        addRow(out, used, "mood:" + now, interleave(
+                merge(svc, "movie", "&with_genres=" + URLEncoder.encode(mood[0], "UTF-8") + "&vote_count.gte=150&sort_by=popularity.desc", movieGenres),
+                merge(svc, "tv", "&with_genres=" + URLEncoder.encode(mood[1], "UTF-8") + "&vote_count.gte=60&sort_by=popularity.desc", tvGenres)));
+        addRow(out, used, "episodes", merge(svc, "tv", "&air_date.gte=" + day(-21) + "&air_date.lte=" + day(0)
+                + "&vote_count.gte=10&sort_by=popularity.desc", tvGenres));
+        addRow(out, used, "acclaimed", interleave(
+                merge(svc, "movie", "&vote_average.gte=7.6&vote_count.gte=1500&sort_by=popularity.desc", movieGenres),
+                merge(svc, "tv", "&vote_average.gte=7.8&vote_count.gte=600&sort_by=popularity.desc", tvGenres)));
+        int each = 0;
+        for (Map.Entry<Integer, String[]> e : svc.entrySet()) {
+            if (each++ >= 5) break;
+            String popular = "&vote_count.gte=80&sort_by=popularity.desc";
+            addRow(out, used, "popular:" + e.getValue()[1], interleave(
+                    discover("movie", e.getKey(), e.getValue(), popular, movieGenres),
+                    discover("tv", e.getKey(), e.getValue(), popular, tvGenres)));
+        }
+        rows = out;
+        AppLog.w("rows: " + out.size() + " rows");
+    }
+
+    private static void addRow(List<Row> out, Set<String> used, String id, List<Pick> items) {
+        List<Pick> row = new ArrayList<>();
+        for (Pick p : items) if (row.size() < ROW_MAX && p.pkg != null && p.backdrop != null && used.add(key(p))) row.add(p);
+        if (row.size() >= 3) out.add(new Row(id, row));
+    }
+
+    /** One query per service, taken in turns, so a row mixes the apps. */
+    private List<Pick> merge(Map<Integer, String[]> svc, String kind, String query, Map<Integer, String> genres) throws Exception {
+        List<List<Pick>> lists = new ArrayList<>();
+        for (Map.Entry<Integer, String[]> e : svc.entrySet()) lists.add(discover(kind, e.getKey(), e.getValue(), query, genres));
+        List<Pick> out = new ArrayList<>();
+        Set<String> seen = new HashSet<>();
+        for (int i = 0; i < ROW_EACH; i++) {
+            for (List<Pick> l : lists) if (i < l.size() && seen.add(key(l.get(i)))) out.add(l.get(i));
+        }
+        return out;
+    }
+
+    /** One service's titles for a query, streaming by subscription in REGION, with their app already known. */
+    private List<Pick> discover(String kind, int provider, String[] service, String query, Map<Integer, String> genres) throws Exception {
+        JSONArray a = get("/discover/" + kind + "?language=" + lang() + "&watch_region=" + REGION
+                + "&with_watch_monetization_types=flatrate&include_adult=false&with_watch_providers=" + provider
+                + query + (Prefs.hideAnimation() ? "&without_genres=" + ANIMATION : "")).getJSONArray("results");
+        List<Pick> out = new ArrayList<>();
+        for (int i = 0; i < a.length() && out.size() < ROW_EACH; i++) {
+            JSONObject o = a.getJSONObject(i);
+            int before = out.size();
+            add(out, o, kind);
+            if (out.size() == before) continue;
+            Pick p = out.get(before);
+            p.app = service[1];
+            p.pkg = service[2];
+            JSONArray ids = o.optJSONArray("genre_ids");
+            StringBuilder names = new StringBuilder();
+            for (int j = 0; ids != null && j < ids.length() && j < 3; j++) {
+                String n = genres.get(ids.optInt(j));
+                if (n == null) continue;
+                if (names.length() > 0) {
+                    if (names.indexOf(",") > 0) break;
+                    names.append(", ");
+                }
+                names.append(n);
+            }
+            p.genres = names.toString();
+            List<String> parts = new ArrayList<>();
+            if (kind.equals("tv")) parts.add(Ui.tr("Series"));
+            if (!p.genres.isEmpty()) parts.add(p.genres);
+            parts.add(name(p.app));
+            p.meta = String.join(" · ", parts);
+            p.detailed = true;
+        }
+        return out;
+    }
+
+    private Map<Integer, String> genreNames(String kind) throws Exception {
+        Map<Integer, String> out = new HashMap<>();
+        JSONArray a = get("/genre/" + kind + "/list?language=" + lang()).getJSONArray("genres");
+        for (int i = 0; i < a.length(); i++) out.put(a.getJSONObject(i).getInt("id"), genre(a.getJSONObject(i).optString("name")));
+        return out;
+    }
+
+    /** A row card's picture at its focused size, or null: it's decoded in the background (onThumbs says when). */
+    Poster thumb(Pick p) {
+        if (p == null || p.backdrop == null || p.id < 0) return null;
+        String key = p.backdrop;
+        synchronized (thumbs) {
+            Poster t = thumbs.get(key);
+            if (t != null) return t;
+            if (!thumbsPending.add(key)) return null;
+        }
+        thumbIo.execute(() -> {
+            Poster t = null;
+            try {
+                t = loadThumb(key);
+            } catch (IOException | RuntimeException | OutOfMemoryError e) {
+                AppLog.w("thumb: " + e.getMessage());
+            }
+            synchronized (thumbs) {
+                thumbsPending.remove(key);
+                if (t != null) {
+                    thumbs.put(key, t);
+                    // The least recently drawn go; one still on screen this frame is only collected once nothing holds it.
+                    while (thumbs.size() > THUMBS_KEPT) thumbs.remove(thumbs.keySet().iterator().next());
+                }
+            }
+            if (t != null) thumbReady();
+        });
+        return null;
+    }
+
+    /**
+     * The title's trailer on YouTube (its video key), in the TV's language if TMDB has one, else in English; null when
+     * there's none. Answers on the main thread.
+     */
+    void trailer(Pick p, java.util.function.Consumer<String> answer) {
+        io.execute(() -> {
+            String key = null;
+            try {
+                for (String language : new String[] {lang(), "en-US"}) {
+                    JSONArray videos = get("/" + p.kind + "/" + p.id + "/videos?language=" + language).getJSONArray("results");
+                    int best = -1;
+                    for (int i = 0; i < videos.length(); i++) {
+                        JSONObject v = videos.getJSONObject(i);
+                        if (!"YouTube".equals(v.optString("site")) || v.optString("key").isEmpty()) continue;
+                        int score = ("Trailer".equals(v.optString("type")) ? 4 : "Teaser".equals(v.optString("type")) ? 2 : 0)
+                                + (v.optBoolean("official") ? 1 : 0);
+                        if (score > best) {
+                            best = score;
+                            key = v.optString("key");
+                        }
+                    }
+                    if (key != null) break;
+                }
+            } catch (Exception e) {
+                AppLog.w("trailer: " + e.getMessage());
+            }
+            String found = key;
+            main.post(() -> answer.accept(found));
+        });
+    }
+
+    /** The home screen hears about new card pictures in batches: one redraw for several that land together. */
+    void onThumbs(Runnable r) { thumbListener = r; }
+
+    private void thumbReady() {
+        synchronized (thumbs) {
+            if (thumbPosted) return;
+            thumbPosted = true;
+        }
+        main.postDelayed(() -> {
+            synchronized (thumbs) { thumbPosted = false; }
+            Runnable r = thumbListener;
+            if (r != null) r.run();
+        }, 60);
+    }
+
+    private Poster loadThumb(String path) throws IOException {
+        File f = new File(new File(context.getCacheDir(), "thumbs"), path.replace("/", ""));
+        if (!f.exists()) fetchFile(f, (HttpURLConnection) new URL(THUMBS + path).openConnection());
+        BitmapFactory.Options bounds = new BitmapFactory.Options();
+        bounds.inJustDecodeBounds = true;
+        BitmapFactory.decodeFile(f.getPath(), bounds);
+        BitmapFactory.Options opts = new BitmapFactory.Options();
+        opts.inPreferredConfig = Bitmap.Config.RGB_565;
+        opts.inSampleSize = 1;
+        while (bounds.outWidth / (opts.inSampleSize * 2) >= THUMB_W) opts.inSampleSize *= 2;
+        Bitmap full = BitmapFactory.decodeFile(f.getPath(), opts);
+        if (full == null) {
+            //noinspection ResultOfMethodCallIgnored
+            f.delete();
+            throw new IOException("unreadable thumbnail");
+        }
+        Bitmap card = Backdrop.card(full, THUMB_W, THUMB_H);
+        if (card != full && !full.isRecycled()) full.recycle();
+        return new Poster(card);
+    }
+
+    private static JSONArray rowsJson(List<Row> rows) throws org.json.JSONException {
+        JSONArray a = new JSONArray();
+        for (Row r : rows) a.put(new JSONObject().put("id", r.id).put("items", picksJson(r.items)));
+        return a;
+    }
+
+    private static List<Row> parseRows(JSONArray a) {
+        List<Row> out = new ArrayList<>();
+        for (int i = 0; i < a.length(); i++) {
+            JSONObject o = a.optJSONObject(i);
+            JSONArray items = o == null ? null : o.optJSONArray("items");
+            if (items != null && o.has("id")) out.add(new Row(o.optString("id"), parse(items)));
+        }
+        return out;
     }
 
     /** A Trakt title ("movie:603") with its details, added to `out` when it's on one of the TV's services. */
@@ -936,7 +1221,18 @@ final class Recs {
         p.title = o.optString(kind.equals("movie") ? "title" : "name");
         p.backdrop = backdrop;
         p.poster = o.isNull("poster_path") ? "" : o.optString("poster_path");
+        extras(p, o);
         list.add(p);
+    }
+
+    /** Synopsis, year and rating, as a list (/discover, /trending) or the details answer them. */
+    private static void extras(Pick p, JSONObject o) {
+        String overview = o.optString("overview", "");
+        if (!overview.isEmpty() && !"null".equals(overview)) p.overview = overview;
+        String date = o.optString(p.kind.equals("movie") ? "release_date" : "first_air_date", "");
+        if (date.length() >= 4) p.year = date.substring(0, 4);
+        double rating = o.optDouble("vote_average", 0);
+        if (o.optInt("vote_count", 0) >= 20 && rating > 0) p.rating = rating;
     }
 
     private static boolean animated(JSONObject o) {
@@ -970,7 +1266,11 @@ final class Recs {
         if (genres != null && genres.length() > 0) {
             String name = genres.getJSONObject(0).optString("name");
             parts.add(genre(name));
+            StringBuilder two = new StringBuilder(genre(name));
+            if (genres.length() > 1) two.append(", ").append(genre(genres.getJSONObject(1).optString("name")));
+            p.genres = two.toString();
         }
+        extras(p, o);
         String length = p.kind.equals("movie") ? runtime(o.optInt("runtime")) : seasons(o.optInt("number_of_seasons"));
         if (length != null) parts.add(length);
         JSONObject wp = o.optJSONObject("watch/providers");
@@ -1294,7 +1594,7 @@ final class Recs {
                 ? plexOpen("/photo/:/transcode?width=1920&height=1080&minSize=1&url=" + URLEncoder.encode(p.backdrop, "UTF-8"))
                 : (HttpURLConnection) new URL(IMAGES + p.backdrop).openConnection());
         File poster = posterFile(p);
-        if (poster == null || poster.exists()) return;
+        if (!light || poster == null || poster.exists()) return;
         try {   // the narrow cards: without a poster they crop the backdrop
             fetchFile(poster, p.id < 0
                     ? plexOpen("/photo/:/transcode?width=500&height=750&minSize=1&url=" + URLEncoder.encode(p.poster, "UTF-8"))
@@ -1326,7 +1626,7 @@ final class Recs {
             c.disconnect();
         }
         if (!part.renameTo(f)) throw new IOException("couldn't save the image");
-        prune(f.getParentFile());
+        prune(f.getParentFile(), "thumbs".equals(f.getParentFile().getName()) ? THUMB_FILES : FILES);
     }
 
     /** Reads the photo (≥ the UI's width) and builds the backdrop (Backdrop: cards plus frosted and glass versions). */
@@ -1388,7 +1688,7 @@ final class Recs {
     }
 
     void trim() {
-        // Explore's picks stay: the home screen opens on that tab, so its cards are never gray when you come back.
+        // This hour's picks stay: the background of the title the home screen opens on is never missing when you come back.
         java.util.Set<String> keep = new java.util.HashSet<>();
         for (Pick p : now(null)) if (p.backdrop != null) keep.add(p.backdrop);
         synchronized (images) {
@@ -1397,7 +1697,7 @@ final class Recs {
         }
     }
 
-    private static void prune(File dir) {
+    private static void prune(File dir, int max) {
         // A download cut off when the system stopped the app leaves its .part behind.
         long stale = System.currentTimeMillis() - 10 * 60_000L;
         File[] parts = dir.listFiles((d, name) -> name.endsWith(".part"));
@@ -1406,9 +1706,9 @@ final class Recs {
             if (parts[i].lastModified() < stale) parts[i].delete();
         }
         File[] files = dir.listFiles((d, name) -> !name.endsWith(".part"));
-        if (files == null || files.length <= FILES) return;
+        if (files == null || files.length <= max) return;
         Arrays.sort(files, (a, b) -> Long.compare(a.lastModified(), b.lastModified()));
-        for (int i = 0; i < files.length - FILES; i++) {
+        for (int i = 0; i < files.length - max; i++) {
             //noinspection ResultOfMethodCallIgnored
             files[i].delete();
         }
@@ -1418,15 +1718,9 @@ final class Recs {
 
     private void save() {
         try {
-            JSONArray a = new JSONArray();
-            for (Pick p : picks) {
-                a.put(new JSONObject().put("id", p.id).put("kind", p.kind).put("title", p.title).put("backdrop", p.backdrop)
-                        .put("poster", p.poster == null ? "" : p.poster).put("link", p.link == null ? "" : p.link)
-                        .put("meta", p.meta).put("app", p.app == null ? "" : p.app).put("pkg", p.pkg == null ? "" : p.pkg)
-                        .put("servicePkg", p.servicePkg == null ? "" : p.servicePkg)
-                        .put("tag", p.tag == null ? "" : p.tag).put("mine", p.mine).put("detailed", p.detailed));
-            }
-            SharedPreferences.Editor e = cache.edit().putString("picks", a.toString()).putInt("period", period).putLong("listAt", listAt)
+            JSONArray a = picksJson(picks);
+            SharedPreferences.Editor e = cache.edit().putString("picks", a.toString()).putString("rows", rowsJson(rows).toString())
+                    .putInt("period", period).putLong("listAt", listAt)
                     .putString("traktActivity", traktActivity).putLong("traktStamp", traktStamp)
                     .putString("language", listLanguage)
                     .putLong("keyStamp", keyStamp).putInt("version", CACHE_VERSION);
@@ -1437,6 +1731,19 @@ final class Recs {
             e.apply();
         } catch (Exception ignored) {
         }
+    }
+
+    private static JSONArray picksJson(List<Pick> list) throws org.json.JSONException {
+        JSONArray a = new JSONArray();
+        for (Pick p : list) {
+            a.put(new JSONObject().put("id", p.id).put("kind", p.kind).put("title", p.title).put("backdrop", p.backdrop)
+                    .put("poster", p.poster == null ? "" : p.poster).put("link", p.link == null ? "" : p.link)
+                    .put("meta", p.meta).put("app", p.app == null ? "" : p.app).put("pkg", p.pkg == null ? "" : p.pkg)
+                    .put("servicePkg", p.servicePkg == null ? "" : p.servicePkg)
+                    .put("tag", p.tag == null ? "" : p.tag).put("mine", p.mine).put("detailed", p.detailed)
+                    .put("overview", p.overview).put("year", p.year).put("genres", p.genres).put("rating", p.rating));
+        }
+        return a;
     }
 
     private static List<Pick> parse(JSONArray a) {
@@ -1458,6 +1765,10 @@ final class Recs {
             p.tag = o.optString("tag").isEmpty() ? null : o.optString("tag");
             p.mine = o.optInt("mine");
             p.detailed = o.optBoolean("detailed");
+            p.overview = o.optString("overview");
+            p.year = o.optString("year");
+            p.genres = o.optString("genres");
+            p.rating = o.optDouble("rating", 0);
             out.add(p);
         }
         return out;
