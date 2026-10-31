@@ -234,6 +234,8 @@ final class Recs {
     private volatile List<Pick> trending = new ArrayList<>();
     // Row cards: decoded on their own thread, so a row's pictures never wait behind the list or a background.
     private final ExecutorService thumbIo = Executors.newSingleThreadExecutor();
+    // A title's link is looked up when it's opened, on its own thread: never behind a list that is being fetched.
+    private final ExecutorService linkIo = Executors.newSingleThreadExecutor();
     private final Map<String, Poster> thumbs = new LinkedHashMap<>(64, 0.75f, true);
     private final Set<String> thumbsPending = new HashSet<>();
     private volatile Runnable thumbListener;
@@ -1426,6 +1428,22 @@ final class Recs {
         return !key.isEmpty() && cache.getInt("wm:refused", 0) != key.hashCode() && Prefs.topContent().equals(Prefs.TOP_PICKS);
     }
 
+    /** Opening this title can wait for its own page in the app: a Watchmode key is set and it has no link yet. */
+    boolean linkable(Pick p) {
+        return p != null && p.link == null && p.id > 0 && p.pkg != null && linksOn();
+    }
+
+    /**
+     * A row's title, as it's opened: its link from what was saved, or looked up now (only the titles someone opens
+     * spend the quota). `done` runs on the main thread, with or without a link.
+     */
+    void link(Pick p, Runnable done) {
+        linkIo.execute(() -> {
+            findLink(p);
+            main.post(done);
+        });
+    }
+
     /** Sets p.link from what was looked up before, or looks it up (2 requests of the free plan's 2,500 a month). */
     private void findLink(Pick p) {
         if (!linksOn() || p.id < 0 || p.pkg == null || p.link != null) return;
@@ -1727,6 +1745,7 @@ final class Recs {
             // Watchmode links of titles no longer in the list go (the refused-key mark stays).
             Set<String> keep = new HashSet<>();
             for (Pick p : picks) keep.add(linkKey(p));
+            for (Row r : rows) for (Pick p : r.items) keep.add(linkKey(p));
             for (String k : cache.getAll().keySet()) if ((k.startsWith("wm:") || k.startsWith("wm2:")) && !k.equals("wm:refused") && !keep.contains(k)) e.remove(k);
             e.apply();
         } catch (Exception ignored) {

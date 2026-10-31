@@ -230,6 +230,7 @@ final class HomeView extends ViewGroup implements Choreographer.FrameCallback, H
     private int menuIndex;
     private WatchNext.Item menuItem;
     private Recs.Pick menuPickItem;   // a row's title held: watch it, or its trailer
+    private Recs.Pick linking;        // the title being opened while its link is looked up
     private String menuTitle = "", menuSub = "";
     private float menuOptionsTop;
     private Paint menuTitlePaint, menuSubPaint, menuOptionPaint;
@@ -3318,6 +3319,26 @@ final class HomeView extends ViewGroup implements Choreographer.FrameCallback, H
         } else if (zone == Z_CARDS) {
             Recs.Pick p = cardIndex < cards.size() ? cards.get(cardIndex) : null;
             if (p == null || p.pkg == null) return;
+            if (recs.linkable(p)) {   // its page in the app is looked up first (once: then it's saved)
+                if (linking == p) return;
+                linking = p;
+                click.open();
+                RectF from = new RectF(cardRects[cardIndex]);
+                // Whichever comes first: the link, or 4 s on a slow network (then the app's home, as without a key).
+                Runnable go = () -> {
+                    if (linking != p) return;
+                    linking = null;
+                    if (!running) return;
+                    HomeApps.Item app = HomeApps.app(p.pkg, Recs.serviceName(p), p.link);
+                    if (!HomeApps.open(activity, app, this, Math.round(from.left), Math.round(from.top),
+                            Math.round(from.width()), Math.round(from.height()))) {
+                        showToast(Ui.trf("Couldn't open {app}.", "app", app.label));
+                    }
+                };
+                recs.link(p, go);
+                postDelayed(go, 4000);
+                return;
+            }
             it = HomeApps.app(p.pkg, Recs.serviceName(p), p.link);
             r = cardRects[cardIndex];
         } else {
